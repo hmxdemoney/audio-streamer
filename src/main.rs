@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 
-// 内嵌针对 iOS / Android / 桌面端深度优化的 HTML+JS 前端
 const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -91,19 +91,13 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 <body>
   <div class="card">
     <h2>电脑系统音频同步</h2>
-    <p class="subtitle">低延迟 • 自动重连 • 支持 iOS 锁屏播放</p>
+    <p class="subtitle">主动静音注入版 • 告别卡带声</p>
     
     <button id="toggleBtn" class="btn">开始连接并播放</button>
 
     <div class="status-box">
       <div id="statusDot" class="status-dot"></div>
       <span id="statusText">等待连接...</span>
-    </div>
-
-    <div class="tips">
-      • <b>iPhone 用户</b>：请关闭手机侧边静音开关。<br>
-      • 启动后直接按电源键锁屏，后台音频持续播放。<br>
-      • 电脑切换耳机/扬声器时，程序会自动无缝重连。
     </div>
   </div>
 
@@ -118,6 +112,8 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
     let isPlaying = false;
     let ws = null;
     let audioCtx = null;
+    let masterGain = null;
+    let dcBlocker = null;
     let streamDest = null;
     let nextStartTime = 0;
     const SAMPLE_RATE = 48000;
@@ -126,7 +122,7 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
       if (!isPlaying) {
         startStreaming();
       } else {
-        stopStreaming();
+        triggerStop();
       }
     };
 
@@ -140,8 +136,17 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
         });
         await audioCtx.resume();
 
-        // 核心：iOS 锁屏保活必须走 MediaStream 桥接
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 1.0;
+
+        dcBlocker = audioCtx.createBiquadFilter();
+        dcBlocker.type = "highpass";
+        dcBlocker.frequency.value = 20; 
+
         streamDest = audioCtx.createMediaStreamDestination();
+        masterGain.connect(dcBlocker);
+        dcBlocker.connect(streamDest);
+
         iosAudio.srcObject = streamDest.stream;
         await iosAudio.play().catch(() => {});
 
@@ -186,11 +191,10 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 
           const source = audioCtx.createBufferSource();
           source.buffer = audioBuffer;
-          source.connect(streamDest);
+          source.connect(masterGain); 
 
           const now = audioCtx.currentTime;
           
-          // 熄屏防爆音缓冲：预留 60ms 应对手机锁屏降频
           if (nextStartTime < now) {
             nextStartTime = now + 0.06;
           }
@@ -198,43 +202,62 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           source.start(nextStartTime);
           nextStartTime += audioBuffer.duration;
 
-          // 自动追赶累积延迟（超过 250ms 时快进对齐）
           if (nextStartTime - now > 0.25) {
             nextStartTime = now + 0.06;
           }
+
+          // 取消渐弱，恢复正常播放
+          masterGain.gain.cancelScheduledValues(now);
+          masterGain.gain.setTargetAtTime(1.0, now, 0.01); 
+
+          const runOutTime = nextStartTime;
+          const fadeStartTime = runOutTime - 0.015; 
+
+          if (fadeStartTime > now) {
+            masterGain.gain.setValueAtTime(1.0, fadeStartTime);
+            masterGain.gain.linearRampToValueAtTime(0.0001, runOutTime);
+          } else {
+            masterGain.gain.linearRampToValueAtTime(0.0001, runOutTime);
+          }
         };
 
-        ws.onclose = () => {
-          stopStreaming();
-          statusText.innerText = "连接已断开";
-        };
-
-        ws.onerror = () => {
-          stopStreaming();
-          statusText.innerText = "连接出错，请检查网络";
-        };
+        ws.onclose = () => triggerStop();
+        ws.onerror = () => triggerStop();
 
       } catch (err) {
         console.error(err);
-        stopStreaming();
+        triggerStop();
         statusText.innerText = "启动失败: " + err.message;
       }
     }
 
-    function stopStreaming() {
+    function triggerStop() {
+      if (!isPlaying) return;
       isPlaying = false;
       btn.innerText = "开始连接并播放";
       btn.classList.remove('active');
       statusDot.classList.remove('online');
-      if (ws) {
-        ws.close();
-        ws = null;
+      statusText.innerText = "正在断开连接...";
+
+      if (masterGain && audioCtx) {
+        const now = audioCtx.currentTime;
+        masterGain.gain.cancelScheduledValues(now);
+        masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+        masterGain.gain.linearRampToValueAtTime(0.0001, now + 0.1);
+
+        setTimeout(() => {
+          cleanUp();
+        }, 150);
+      } else {
+        cleanUp();
       }
-      if (audioCtx) {
-        audioCtx.close();
-        audioCtx = null;
-      }
+    }
+
+    function cleanUp() {
+      if (ws) { ws.close(); ws = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
       iosAudio.srcObject = null;
+      statusText.innerText = "连接已断开";
       if ('mediaSession' in navigator) {
         navigator.mediaSession.playbackState = "none";
       }
@@ -247,20 +270,17 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 #[tokio::main]
 async fn main() {
     println!("=========================================");
-    println!("     系统音频实时串流服务 (全平台优化版)    ");
+    println!("     系统音频实时串流服务 (主动静音填补版)    ");
     println!("=========================================");
 
-    // 1. 创建音频广播通道 (容量 256 帧，避免短暂卡顿丢包)
     let (tx, _rx) = broadcast::channel::<Vec<u8>>(256);
     let tx = Arc::new(tx);
     let tx_clone = Arc::clone(&tx);
 
-    // 2. 独立音频采集与热切换监控线程
     std::thread::spawn(move || {
         let host = cpal::default_host();
 
         loop {
-            // 获取当前系统的默认音频输出设备
             let device = match host.default_output_device() {
                 Some(d) => d,
                 None => {
@@ -288,15 +308,13 @@ async fn main() {
             let stream_active = Arc::new(AtomicBool::new(true));
             let stream_active_callback = Arc::clone(&stream_active);
 
-            // 构建 WASAPI Loopback 输入流
             let stream_result = device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if data.is_empty() { return; }
 
-                    // 将任意声道与 Float32 转为固定的 2 声道 16-bit PCM (立体声)
                     let num_frames = data.len() / channels;
-                    let mut pcm_bytes = Vec::with_capacity(num_frames * 4); // 2 channels * 2 bytes
+                    let mut pcm_bytes = Vec::with_capacity(num_frames * 4); 
 
                     for frame_idx in 0..num_frames {
                         let base = frame_idx * channels;
@@ -329,11 +347,8 @@ async fn main() {
 
                     println!(">>> 音频流已就绪并处于活跃状态");
 
-                    // 持续监测设备切换或流失效
                     while stream_active.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(500));
-
-                        // 检测 Windows 是否切换了默认输出设备（如拔插耳机）
                         if let Some(new_dev) = host.default_output_device() {
                             if new_dev.name().unwrap_or_default() != current_device_name {
                                 println!(">>> 检测到默认音频输出设备已变更，正在平滑无缝重连...");
@@ -355,7 +370,6 @@ async fn main() {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "127.0.0.1".into());
 
-    // 3. 注册 mDNS 多播局域网域名 (audio.local)
     let mdns = ServiceDaemon::new().expect("初始化 mDNS 失败");
     let service_type = "_http._tcp.local.";
     let instance_name = "audio-stream";
@@ -373,7 +387,6 @@ async fn main() {
 
     let _ = mdns.register(service_info);
 
-    // 4. 构建 Web 路由服务
     let app = Router::new()
         .route("/", get(|| async { Html(HTML_CONTENT) }))
         .route("/ws", get(move |ws: WebSocketUpgrade| {
@@ -383,24 +396,48 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
-        .expect("端口 8000 绑定失败，可能被其他程序占用");
+        .expect("端口 8000 绑定失败");
 
     println!("-----------------------------------------");
     println!(" 🚀 服务已启动！局域网已广播专属域名：");
     println!(" 📱 iPhone / Safari 专属直接访问：");
     println!("    👉 http://audio.local:{}", port);
-    println!(" 🌐 原 IP 访问方式备选：");
-    println!("    👉 http://{}:{}", local_ip, port);
     println!("-----------------------------------------");
 
     axum::serve(listener, app).await.unwrap();
 }
 
+// ==========================================
+// 核心修复逻辑：WebSocket 数据下发处理器
+// ==========================================
 async fn handle_socket(mut socket: WebSocket, tx: Arc<broadcast::Sender<Vec<u8>>>) {
     let mut rx = tx.subscribe();
-    while let Ok(data) = rx.recv().await {
-        if socket.send(Message::Binary(data)).await.is_err() {
-            break;
+    
+    // 生成一段 50 毫秒的纯静音数据包 (双声道 48000Hz 16-bit PCM)
+    // 计算方式：48000 采样/秒 * 0.05 秒 = 2400 个采样/声道
+    // 2400 * 2 (声道) * 2 (字节/i16) = 9600 字节
+    let silence_chunk = vec![0u8; 9600];
+
+    loop {
+        // 使用 timeout 监听通道：如果 50 毫秒内 Windows 没出任何声音 (WASAPI 装死)
+        match timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Ok(data)) => {
+                // 正常收到声音，转发给手机
+                if socket.send(Message::Binary(data)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Err(_)) => {
+                // 广播通道错误
+                break;
+            }
+            Err(_) => {
+                // 【核心修复】50毫秒超时了！说明电脑此时静音了
+                // 主动强制给手机发送“0”，用数字静音填满手机的缓冲区，彻底挤掉最后一帧，打破卡带循环！
+                if socket.send(Message::Binary(silence_chunk.clone())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
