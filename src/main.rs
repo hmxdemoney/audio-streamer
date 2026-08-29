@@ -7,10 +7,12 @@ use axum::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
-// 内嵌优化后的前端页面 (针对 iOS 熄屏、Safari、Chrome 深度优化)
+// 内嵌针对 iOS / Android / 桌面端深度优化的 HTML+JS 前端
 const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -25,42 +27,42 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       min-height: 100vh;
-      background: #0f1117;
-      color: #fff;
+      background: #0d1117;
+      color: #c9d1d9;
       font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Segoe UI", Roboto, sans-serif;
       text-align: center;
       padding: 20px;
     }
     .card {
-      background: #1a1d26;
-      border: 1px solid #2d3139;
+      background: #161b22;
+      border: 1px solid #30363d;
       border-radius: 20px;
-      padding: 30px 24px;
+      padding: 32px 24px;
       width: 100%;
       max-width: 380px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.4);
     }
-    h2 { font-size: 20px; margin-bottom: 8px; color: #fff; }
-    .subtitle { font-size: 13px; color: #8b949e; margin-bottom: 25px; line-height: 1.5; }
+    h2 { font-size: 20px; margin-bottom: 8px; color: #f0f6fc; }
+    .subtitle { font-size: 13px; color: #8b949e; margin-bottom: 24px; line-height: 1.5; }
     .btn {
       width: 100%;
       padding: 16px 0;
       font-size: 17px;
       font-weight: 600;
       color: #000;
-      background: #00e676;
+      background: #2ea043;
       border: none;
-      border-radius: 14px;
+      border-radius: 12px;
       cursor: pointer;
       transition: all 0.2s ease;
       -webkit-tap-highlight-color: transparent;
     }
     .btn:active { transform: scale(0.98); opacity: 0.9; }
-    .btn.active { background: #ff5252; color: #fff; }
+    .btn.active { background: #da3633; color: #fff; }
     .status-box {
       margin-top: 20px;
       font-size: 14px;
-      color: #00e676;
+      color: #58a6ff;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -72,23 +74,24 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
       border-radius: 50%;
       background: #8b949e;
     }
-    .status-dot.online { background: #00e676; box-shadow: 0 0 10px #00e676; }
+    .status-dot.online { background: #3fb950; box-shadow: 0 0 10px #3fb950; }
     .tips {
       margin-top: 24px;
       font-size: 12px;
-      color: #6e7681;
+      color: #8b949e;
       text-align: left;
       line-height: 1.6;
-      background: #14161d;
-      padding: 12px 14px;
+      background: #0d1117;
+      padding: 14px;
       border-radius: 10px;
+      border: 1px solid #21262d;
     }
   </style>
 </head>
 <body>
   <div class="card">
     <h2>电脑系统音频同步</h2>
-    <p class="subtitle">低延迟实时串流 • 支持 iOS 锁屏播放</p>
+    <p class="subtitle">低延迟 • 自动重连 • 支持 iOS 锁屏播放</p>
     
     <button id="toggleBtn" class="btn">开始连接并播放</button>
 
@@ -98,8 +101,9 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
     </div>
 
     <div class="tips">
-      • <b>iPhone 提示</b>：请确认手机侧边静音开关已关闭。<br>
-      • 启动后直接按电源键锁屏，声音不会中断。
+      • <b>iPhone 用户</b>：请关闭手机侧边静音开关。<br>
+      • 启动后直接按电源键锁屏，后台音频持续播放。<br>
+      • 电脑切换耳机/扬声器时，程序会自动无缝重连。
     </div>
   </div>
 
@@ -128,7 +132,7 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 
     async function startStreaming() {
       try {
-        statusText.innerText = "正在初始化音频...";
+        statusText.innerText = "正在激活音频引擎...";
         
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: SAMPLE_RATE,
@@ -136,14 +140,15 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
         });
         await audioCtx.resume();
 
+        // 核心：iOS 锁屏保活必须走 MediaStream 桥接
         streamDest = audioCtx.createMediaStreamDestination();
         iosAudio.srcObject = streamDest.stream;
         await iosAudio.play().catch(() => {});
 
         if ('mediaSession' in navigator) {
           navigator.mediaSession.metadata = new MediaMetadata({
-            title: "电脑扬声器音频",
-            artist: "实时串流中 (支持熄屏)",
+            title: "电脑系统音频",
+            artist: "实时串流中",
             album: "局域网同步"
           });
           navigator.mediaSession.playbackState = "playing";
@@ -159,12 +164,14 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           isPlaying = true;
           btn.innerText = "断开播放";
           btn.classList.add('active');
-          statusText.innerText = "正在实时同步音频 (可锁屏)";
+          statusText.innerText = "正在播放 (可直接熄屏)";
           statusDot.classList.add('online');
         };
 
         ws.onmessage = (event) => {
           const int16Array = new Int16Array(event.data);
+          if (int16Array.length === 0) return;
+
           const numChannels = 2;
           const frameCount = int16Array.length / numChannels;
           
@@ -182,14 +189,18 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           source.connect(streamDest);
 
           const now = audioCtx.currentTime;
+          
+          // 熄屏防爆音缓冲：预留 60ms 应对手机锁屏降频
           if (nextStartTime < now) {
-            nextStartTime = now + 0.015;
+            nextStartTime = now + 0.06;
           }
+          
           source.start(nextStartTime);
           nextStartTime += audioBuffer.duration;
 
-          if (nextStartTime - now > 0.15) {
-            nextStartTime = now + 0.03;
+          // 自动追赶累积延迟（超过 250ms 时快进对齐）
+          if (nextStartTime - now > 0.25) {
+            nextStartTime = now + 0.06;
           }
         };
 
@@ -236,49 +247,119 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 #[tokio::main]
 async fn main() {
     println!("=========================================");
-    println!("     系统音频实时串流服务器 (mDNS 域名版)     ");
+    println!("     系统音频实时串流服务 (全平台优化版)    ");
     println!("=========================================");
 
-    // 1. 创建音频广播通道
-    let (tx, _rx) = broadcast::channel::<Vec<u8>>(128);
+    // 1. 创建音频广播通道 (容量 256 帧，避免短暂卡顿丢包)
+    let (tx, _rx) = broadcast::channel::<Vec<u8>>(256);
     let tx = Arc::new(tx);
     let tx_clone = Arc::clone(&tx);
 
-    // 2. 启动系统音频捕获线程 (WASAPI Loopback)
+    // 2. 独立音频采集与热切换监控线程
     std::thread::spawn(move || {
         let host = cpal::default_host();
-        let device = host.default_output_device().expect("【错误】未找到系统默认扬声器！");
-        let default_config = device.default_output_config().expect("【错误】无法获取设备音频配置");
-        let config: cpal::StreamConfig = default_config.into();
 
-        let stream = device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mut pcm_bytes = Vec::with_capacity(data.len() * 2);
-                for &sample in data {
-                    let clamped = sample.clamp(-1.0, 1.0);
-                    let sample_i16 = (clamped * 32767.0) as i16;
-                    pcm_bytes.extend_from_slice(&sample_i16.to_le_bytes());
+        loop {
+            // 获取当前系统的默认音频输出设备
+            let device = match host.default_output_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("【未检测到默认音频设备】1秒后重试...");
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
-                let _ = tx_clone.send(pcm_bytes);
-            },
-            |err| eprintln!("【音频流错误】: {}", err),
-            None,
-        ).expect("【错误】无法初始化音频 Loopback 流");
+            };
 
-        stream.play().expect("【错误】启动音频流捕获失败");
-        std::thread::park();
+            let current_device_name = device.name().unwrap_or_else(|_| "Default Audio Device".into());
+            println!(">>> 正在捕获设备声音: {}", current_device_name);
+
+            let default_config = match device.default_output_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("【获取设备配置失败】: {}，1秒后重试...", e);
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            let config: cpal::StreamConfig = default_config.into();
+            let channels = config.channels as usize;
+            let tx_inner = Arc::clone(&tx_clone);
+            let stream_active = Arc::new(AtomicBool::new(true));
+            let stream_active_callback = Arc::clone(&stream_active);
+
+            // 构建 WASAPI Loopback 输入流
+            let stream_result = device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if data.is_empty() { return; }
+
+                    // 将任意声道与 Float32 转为固定的 2 声道 16-bit PCM (立体声)
+                    let num_frames = data.len() / channels;
+                    let mut pcm_bytes = Vec::with_capacity(num_frames * 4); // 2 channels * 2 bytes
+
+                    for frame_idx in 0..num_frames {
+                        let base = frame_idx * channels;
+                        let left_sample = data[base];
+                        let right_sample = if channels > 1 { data[base + 1] } else { left_sample };
+
+                        let left_i16 = (left_sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        let right_i16 = (right_sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+
+                        pcm_bytes.extend_from_slice(&left_i16.to_le_bytes());
+                        pcm_bytes.extend_from_slice(&right_i16.to_le_bytes());
+                    }
+
+                    let _ = tx_inner.send(pcm_bytes);
+                },
+                move |err| {
+                    eprintln!("【音频流失效/设备被切换】: {}", err);
+                    stream_active_callback.store(false, Ordering::SeqCst);
+                },
+                None,
+            );
+
+            match stream_result {
+                Ok(stream) => {
+                    if let Err(e) = stream.play() {
+                        eprintln!("【启动音频流失败】: {}", e);
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+
+                    println!(">>> 音频流已就绪并处于活跃状态");
+
+                    // 持续监测设备切换或流失效
+                    while stream_active.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(500));
+
+                        // 检测 Windows 是否切换了默认输出设备（如拔插耳机）
+                        if let Some(new_dev) = host.default_output_device() {
+                            if new_dev.name().unwrap_or_default() != current_device_name {
+                                println!(">>> 检测到默认音频输出设备已变更，正在平滑无缝重连...");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("【构建音频流失败】: {}，1秒后重试...", e);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
     });
 
     let port = 8000;
-    let local_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".into());
+    let local_ip = local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "127.0.0.1".into());
 
-    // 3. 启动局域网 mDNS 多播广播服务
-    // 使得局域网设备可以通过 http://audio.local:8000 直接访问
-    let mdns = ServiceDaemon::new().expect("创建 mDNS 守护进程失败");
+    // 3. 注册 mDNS 多播局域网域名 (audio.local)
+    let mdns = ServiceDaemon::new().expect("初始化 mDNS 失败");
     let service_type = "_http._tcp.local.";
     let instance_name = "audio-stream";
-    let host_name = "audio.local."; // 注册的主机域名
+    let host_name = "audio.local.";
     let properties: HashMap<String, String> = HashMap::new();
 
     let service_info = ServiceInfo::new(
@@ -288,11 +369,11 @@ async fn main() {
         &local_ip,
         port,
         properties,
-    ).expect("配置 mDNS 服务失败");
+    ).expect("配置 mDNS 失败");
 
-    mdns.register(service_info).expect("注册 mDNS 局域网广播失败");
+    let _ = mdns.register(service_info);
 
-    // 4. 构建 Web 路由
+    // 4. 构建 Web 路由服务
     let app = Router::new()
         .route("/", get(|| async { Html(HTML_CONTENT) }))
         .route("/ws", get(move |ws: WebSocketUpgrade| {
@@ -302,7 +383,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
-        .expect("端口绑定失败，可能被占用");
+        .expect("端口 8000 绑定失败，可能被其他程序占用");
 
     println!("-----------------------------------------");
     println!(" 🚀 服务已启动！局域网已广播专属域名：");
