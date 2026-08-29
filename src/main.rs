@@ -11,35 +11,95 @@ use tokio::sync::broadcast;
 const HTML_CONTENT: &str = r#"
 <!DOCTYPE html>
 <html>
-<head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>电脑声音同步</title></head>
-<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:80vh;font-family:sans-serif;">
-  <h2>电脑系统音频实时串流</h2>
-  <button id="btn" style="padding:15px 30px;font-size:18px;">点击连接并播放声音</button>
-  <p id="status">未连接</p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>电脑音频同步 (支持熄屏)</title>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 85vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      background: #f7f9fa;
+    }
+    button {
+      padding: 16px 36px;
+      font-size: 18px;
+      font-weight: bold;
+      color: #fff;
+      background: #007aff;
+      border: none;
+      border-radius: 28px;
+      box-shadow: 0 4px 12px rgba(0,122,255,0.3);
+      cursor: pointer;
+    }
+    button:disabled { background: #bbb; box-shadow: none; }
+    p { margin-top: 20px; color: #666; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <h2>电脑系统声音实时播放</h2>
+  <button id="btn">点击连接并开始播放</button>
+  <p id="status">点击上方按钮启动</p>
+
+  <!-- 用于欺骗系统后台保活的静音占位音频 -->
+  <audio id="silentAudio" loop playsinline></audio>
+
   <script>
     const btn = document.getElementById('btn');
     const status = document.getElementById('status');
+    const silentAudio = document.getElementById('silentAudio');
+
+    // 生成极短的 1 秒无声 WAV 音频 Data URI
+    function createSilentWav() {
+      return "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
+    }
 
     btn.onclick = async () => {
-      // 采样率需与服务端一致（通常为 48000Hz）
+      btn.disabled = true;
+      status.innerText = '正在初始化音频与后台服务...';
+
+      // 1. 激活并播放无声 HTML5 媒体元素，骗取系统后台常驻权限
+      silentAudio.src = createSilentWav();
+      try {
+        await silentAudio.play();
+      } catch (e) {
+        console.warn('Silent audio play failed:', e);
+      }
+
+      // 2. 注册系统控制中心 (锁屏界面展示)
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "电脑系统音频串流",
+          artist: "局域网同步",
+          album: "实时音频"
+        });
+        navigator.mediaSession.setActionHandler('play', () => { silentAudio.play(); });
+        navigator.mediaSession.setActionHandler('pause', () => { silentAudio.pause(); });
+      }
+
+      // 3. 初始化 Web Audio API
       const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
       await audioCtx.resume();
 
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${location.host}/ws`);
       ws.binaryType = 'arraybuffer';
-      status.innerText = '正在连接...';
 
       let nextStartTime = audioCtx.currentTime;
 
-      ws.onopen = () => { status.innerText = '正在播放电脑声音...'; btn.disabled = true; };
-      
+      ws.onopen = () => {
+        status.innerText = '正在实时播放电脑声音（支持熄屏）';
+      };
+
       ws.onmessage = (event) => {
         const floatData = new Float32Array(event.data);
-        // 创建双声道或单声道缓冲区
         const audioBuffer = audioCtx.createBuffer(2, floatData.length / 2, 48000);
         
-        // 解构双声道交错数据 (Interleaved L/R)
         const leftChannel = audioBuffer.getChannelData(0);
         const rightChannel = audioBuffer.getChannelData(1);
         for (let i = 0, j = 0; i < floatData.length; i += 2, j++) {
@@ -53,13 +113,143 @@ const HTML_CONTENT: &str = r#"
 
         const currentTime = audioCtx.currentTime;
         if (nextStartTime < currentTime) {
-          nextStartTime = currentTime + 0.02; // 缓冲区轻微防断音
+          nextStartTime = currentTime + 0.02;
         }
         source.start(nextStartTime);
         nextStartTime += audioBuffer.duration;
       };
 
-      ws.onclose = () => { status.innerText = '连接已断开'; btn.disabled = false; };
+      ws.onclose = () => {
+        status.innerText = '连接已断开';
+        btn.disabled = false;
+      };
+
+      ws.onerror = () => {
+        status.innerText = '连接出错，请检查网络';
+        btn.disabled = false;
+      };
+    };
+  </script>
+</body>
+</html><!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>电脑音频同步 (支持熄屏)</title>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 85vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      background: #f7f9fa;
+    }
+    button {
+      padding: 16px 36px;
+      font-size: 18px;
+      font-weight: bold;
+      color: #fff;
+      background: #007aff;
+      border: none;
+      border-radius: 28px;
+      box-shadow: 0 4px 12px rgba(0,122,255,0.3);
+      cursor: pointer;
+    }
+    button:disabled { background: #bbb; box-shadow: none; }
+    p { margin-top: 20px; color: #666; font-size: 15px; }
+  </style>
+</head>
+<body>
+  <h2>电脑系统声音实时播放</h2>
+  <button id="btn">点击连接并开始播放</button>
+  <p id="status">点击上方按钮启动</p>
+
+  <!-- 用于欺骗系统后台保活的静音占位音频 -->
+  <audio id="silentAudio" loop playsinline></audio>
+
+  <script>
+    const btn = document.getElementById('btn');
+    const status = document.getElementById('status');
+    const silentAudio = document.getElementById('silentAudio');
+
+    // 生成极短的 1 秒无声 WAV 音频 Data URI
+    function createSilentWav() {
+      return "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
+    }
+
+    btn.onclick = async () => {
+      btn.disabled = true;
+      status.innerText = '正在初始化音频与后台服务...';
+
+      // 1. 激活并播放无声 HTML5 媒体元素，骗取系统后台常驻权限
+      silentAudio.src = createSilentWav();
+      try {
+        await silentAudio.play();
+      } catch (e) {
+        console.warn('Silent audio play failed:', e);
+      }
+
+      // 2. 注册系统控制中心 (锁屏界面展示)
+      if ('mediaSession' in navigator) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: "电脑系统音频串流",
+          artist: "局域网同步",
+          album: "实时音频"
+        });
+        navigator.mediaSession.setActionHandler('play', () => { silentAudio.play(); });
+        navigator.mediaSession.setActionHandler('pause', () => { silentAudio.pause(); });
+      }
+
+      // 3. 初始化 Web Audio API
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+      await audioCtx.resume();
+
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${protocol}//${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+
+      let nextStartTime = audioCtx.currentTime;
+
+      ws.onopen = () => {
+        status.innerText = '正在实时播放电脑声音（支持熄屏）';
+      };
+
+      ws.onmessage = (event) => {
+        const floatData = new Float32Array(event.data);
+        const audioBuffer = audioCtx.createBuffer(2, floatData.length / 2, 48000);
+        
+        const leftChannel = audioBuffer.getChannelData(0);
+        const rightChannel = audioBuffer.getChannelData(1);
+        for (let i = 0, j = 0; i < floatData.length; i += 2, j++) {
+          leftChannel[j] = floatData[i];
+          rightChannel[j] = floatData[i + 1];
+        }
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+
+        const currentTime = audioCtx.currentTime;
+        if (nextStartTime < currentTime) {
+          nextStartTime = currentTime + 0.02;
+        }
+        source.start(nextStartTime);
+        nextStartTime += audioBuffer.duration;
+      };
+
+      ws.onclose = () => {
+        status.innerText = '连接已断开';
+        btn.disabled = false;
+      };
+
+      ws.onerror = () => {
+        status.innerText = '连接出错，请检查网络';
+        btn.disabled = false;
+      };
     };
   </script>
 </body>
