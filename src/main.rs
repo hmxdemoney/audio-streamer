@@ -5,6 +5,8 @@ use axum::{
     Router,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -101,7 +103,6 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- 用于接管 iOS 媒体会话的流媒体 audio 标签 -->
   <audio id="iosAudio" autoplay playsinline></audio>
 
   <script>
@@ -129,19 +130,16 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
       try {
         statusText.innerText = "正在初始化音频...";
         
-        // 1. 初始化 AudioContext
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: SAMPLE_RATE,
           latencyHint: "interactive"
         });
         await audioCtx.resume();
 
-        // 2. iOS 专属后台保活：通过 MediaStreamDestination 桥接至 <audio>
         streamDest = audioCtx.createMediaStreamDestination();
         iosAudio.srcObject = streamDest.stream;
         await iosAudio.play().catch(() => {});
 
-        // 3. 注册系统控制中心 (锁屏控件)
         if ('mediaSession' in navigator) {
           navigator.mediaSession.metadata = new MediaMetadata({
             title: "电脑扬声器音频",
@@ -151,7 +149,6 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           navigator.mediaSession.playbackState = "playing";
         }
 
-        // 4. 建立 WebSocket 连接
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(`${protocol}//${location.host}/ws`);
         ws.binaryType = 'arraybuffer';
@@ -167,7 +164,6 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
         };
 
         ws.onmessage = (event) => {
-          // 接收 16-bit PCM (Int16) 数组并转为 WebAudio Float32
           const int16Array = new Int16Array(event.data);
           const numChannels = 2;
           const frameCount = int16Array.length / numChannels;
@@ -177,7 +173,6 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           const rightChannel = audioBuffer.getChannelData(1);
 
           for (let i = 0, j = 0; i < int16Array.length; i += 2, j++) {
-            // Int16 转 Float32 (-1.0 ~ 1.0)
             leftChannel[j] = int16Array[i] / 32768.0;
             rightChannel[j] = int16Array[i + 1] / 32768.0;
           }
@@ -186,15 +181,13 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
           source.buffer = audioBuffer;
           source.connect(streamDest);
 
-          // 动态防爆音与抗抖动机制
           const now = audioCtx.currentTime;
           if (nextStartTime < now) {
-            nextStartTime = now + 0.015; // 15ms 极小缓冲
+            nextStartTime = now + 0.015;
           }
           source.start(nextStartTime);
           nextStartTime += audioBuffer.duration;
 
-          // 动态追赶延迟：防止网络卡顿后积攒过多延迟
           if (nextStartTime - now > 0.15) {
             nextStartTime = now + 0.03;
           }
@@ -243,54 +236,63 @@ const HTML_CONTENT: &str = r#"<!DOCTYPE html>
 #[tokio::main]
 async fn main() {
     println!("=========================================");
-    println!("     系统音频实时串流服务器 (低延迟版)     ");
+    println!("     系统音频实时串流服务器 (mDNS 域名版)     ");
     println!("=========================================");
 
-    // 创建广播队列 (可同时给多台手机广播音频)
+    // 1. 创建音频广播通道
     let (tx, _rx) = broadcast::channel::<Vec<u8>>(128);
     let tx = Arc::new(tx);
     let tx_clone = Arc::clone(&tx);
 
-    // 在独立音频线程捕获系统声音 (WASAPI Loopback)
+    // 2. 启动系统音频捕获线程 (WASAPI Loopback)
     std::thread::spawn(move || {
         let host = cpal::default_host();
-        
-        let device = host.default_output_device().expect("【错误】未找到系统默认扬声器/输出设备！");
-        println!("正在捕获系统声音设备: {}", device.name().unwrap_or_else(|_| "Default".into()));
-
+        let device = host.default_output_device().expect("【错误】未找到系统默认扬声器！");
         let default_config = device.default_output_config().expect("【错误】无法获取设备音频配置");
-        println!(
-            "系统声卡参数: 采样率 {} Hz, 声道数 {}",
-            default_config.sample_rate().0,
-            default_config.channels()
-        );
-
         let config: cpal::StreamConfig = default_config.into();
 
-        // 捕获系统主混音输出
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // 将 Float32 PCM 压缩编码为 16-bit PCM (Int16) 以节省 50% 传输带宽
                 let mut pcm_bytes = Vec::with_capacity(data.len() * 2);
                 for &sample in data {
-                    // 削波保护 (-1.0 ~ 1.0)
                     let clamped = sample.clamp(-1.0, 1.0);
                     let sample_i16 = (clamped * 32767.0) as i16;
                     pcm_bytes.extend_from_slice(&sample_i16.to_le_bytes());
                 }
-                // 广播给所有已连接客户端
                 let _ = tx_clone.send(pcm_bytes);
             },
             |err| eprintln!("【音频流错误】: {}", err),
             None,
-        ).expect("【错误】无法初始化音频 Loopback 流，请确认系统声卡工作正常");
+        ).expect("【错误】无法初始化音频 Loopback 流");
 
         stream.play().expect("【错误】启动音频流捕获失败");
-        std::thread::park(); // 保持常驻
+        std::thread::park();
     });
 
-    // 路由构建
+    let port = 8000;
+    let local_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".into());
+
+    // 3. 启动局域网 mDNS 多播广播服务
+    // 使得局域网设备可以通过 http://audio.local:8000 直接访问
+    let mdns = ServiceDaemon::new().expect("创建 mDNS 守护进程失败");
+    let service_type = "_http._tcp.local.";
+    let instance_name = "audio-stream";
+    let host_name = "audio.local."; // 注册的主机域名
+    let properties: HashMap<String, String> = HashMap::new();
+
+    let service_info = ServiceInfo::new(
+        service_type,
+        instance_name,
+        host_name,
+        &local_ip,
+        port,
+        properties,
+    ).expect("配置 mDNS 服务失败");
+
+    mdns.register(service_info).expect("注册 mDNS 局域网广播失败");
+
+    // 4. 构建 Web 路由
     let app = Router::new()
         .route("/", get(|| async { Html(HTML_CONTENT) }))
         .route("/ws", get(move |ws: WebSocketUpgrade| {
@@ -298,18 +300,16 @@ async fn main() {
             async move { ws.on_upgrade(|socket| handle_socket(socket, tx)) }
         }));
 
-    // 绑定端口
-    let port = 8000;
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .expect("端口绑定失败，可能被占用");
 
-    // 获取本机局域网 IP 并打印访问方式
-    let local_ip = local_ip_address::local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "127.0.0.1".into());
-
     println!("-----------------------------------------");
-    println!(" 服务已就绪！请在手机 Safari 浏览器打开：");
-    println!(" 👉 http://{}:{}", local_ip, port);
+    println!(" 🚀 服务已启动！局域网已广播专属域名：");
+    println!(" 📱 iPhone / Safari 专属直接访问：");
+    println!("    👉 http://audio.local:{}", port);
+    println!(" 🌐 原 IP 访问方式备选：");
+    println!("    👉 http://{}:{}", local_ip, port);
     println!("-----------------------------------------");
 
     axum::serve(listener, app).await.unwrap();
@@ -317,10 +317,8 @@ async fn main() {
 
 async fn handle_socket(mut socket: WebSocket, tx: Arc<broadcast::Sender<Vec<u8>>>) {
     let mut rx = tx.subscribe();
-    // 异步循环下发音频帧
     while let Ok(data) = rx.recv().await {
         if socket.send(Message::Binary(data)).await.is_err() {
-            // 客户端断开连接，退出处理
             break;
         }
     }
