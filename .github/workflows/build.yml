@@ -48,6 +48,11 @@ jobs:
     name: Release Latest
     needs: build
     runs-on: ubuntu-latest
+    
+    # [新增的内容] 授予 GITHUB_TOKEN 创建和更新 Release 的权限
+    permissions:
+      contents: write
+      
     steps:
       - name: Download Windows Artifact
         uses: actions/download-artifact@v4
