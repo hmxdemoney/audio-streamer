@@ -1,4 +1,4 @@
-name: Build Windows Exe
+name: Build and Release
 
 on:
   push:
@@ -7,12 +7,68 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: audio-streamer-windows.exe
+          - os: ubuntu-latest
+            asset_name: audio-streamer-linux
+
     steps:
       - uses: actions/checkout@v4
+
+      # Install Linux dependencies
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - uses: dtolnay/rust-toolchain@stable
+
       - run: cargo build --release
-      - uses: actions/upload-artifact@v4
+
+      - name: Rename artifact (Linux)
+        if: runner.os == 'Linux'
+        run: mv target/release/audio-streamer target/release/${{ matrix.asset_name }}
+
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        run: mv target/release/audio-streamer.exe target/release/${{ matrix.asset_name }}
+        shell: bash
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: audio-streamer-windows
-          path: target/release/audio-streamer.exe
+          name: ${{ matrix.asset_name }}
+          path: target/release/${{ matrix.asset_name }}
+
+  release:
+    name: Release Latest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: audio-streamer-windows.exe
+          path: artifacts
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: audio-streamer-linux
+          path: artifacts
+
+      - name: Update Latest Release tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Release
+          body: "Auto-generated latest release from main/master."
+          prerelease: false
+          make_latest: true
+          files: |
+            artifacts/audio-streamer-windows.exe
+            artifacts/audio-streamer-linux

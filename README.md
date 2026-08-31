@@ -4,6 +4,8 @@ English | [简体中文](README_zh.md)
 
 This is a lightweight system audio synchronization tool that allows you to stream any sound playing on your computer to your phone or tablet in real-time over your local network. It is specifically optimized for iPhone and the Safari browser.
 
+📥 **[Download Latest Release](https://github.com/hmxdemoney/audio-streamer/releases/latest)**
+
 ## ✨ Core Features
 
 *   **Out of the Box**: No need to install complex client apps; just use your phone's browser to start playing.
